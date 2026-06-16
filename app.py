@@ -3,21 +3,23 @@ from flask import Flask, render_template_string, request, redirect, url_for, fla
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote_plus
+import os
+import smtplib
+from email.message import EmailMessage
 
 app = Flask(__name__)
-app.secret_key = "LEXCONTROL_CAMBIAR_CLAVE_2026"
+app.secret_key = os.environ.get("SECRET_KEY", "LEXCONTROL_CAMBIAR_CLAVE_2026")
 
-DB_NAME = "lexcontrol.db"
+DB_NAME = os.environ.get("DB_NAME", "lexcontrol.db")
 UPLOAD_FOLDER = Path("uploads")
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 
 ALLOWED_IMAGES = {"png", "jpg", "jpeg", "gif", "webp"}
 ALLOWED_DOCS = {"pdf", "doc", "docx", "jpg", "jpeg", "png", "webp"}
 
-# Enlaces jurídicos oficiales / públicos
 SCJN_BUSCADOR = "https://bj.scjn.gob.mx/"
 SCJN_TESIS = "https://sjf2.scjn.gob.mx/busqueda-principal-tesis"
 BOLETIN_PJBC = "https://www.pjbc.gob.mx/boletin_judicial.aspx"
@@ -32,6 +34,11 @@ def conectar():
 
 def permitido(filename, allowed):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed
+
+def agregar_columna_si_no_existe(con, tabla, columna, definicion):
+    columnas = [c[1] for c in con.execute(f"PRAGMA table_info({tabla})").fetchall()]
+    if columna not in columnas:
+        con.execute(f"ALTER TABLE {tabla} ADD COLUMN {columna} {definicion}")
 
 def crear_tablas():
     with conectar() as con:
@@ -51,7 +58,7 @@ def crear_tablas():
             INSERT OR IGNORE INTO configuracion
             (id, nombre_sistema, subtitulo, portada, logo, color_principal, color_secundario, color_acento)
             VALUES
-            (1, 'LEXCONTROL Jurídico', 'Control profesional de expedientes, promociones y vencimientos', '', '', '#0f172a', '#1e293b', '#b38b2e')
+            (1, 'LEXCONTROL Jurídico', 'Control profesional de expedientes, promociones, audiencias y vencimientos', '', '', '#0f172a', '#1e293b', '#b38b2e')
         """)
 
         con.execute("""
@@ -62,10 +69,12 @@ def crear_tablas():
                 password_hash TEXT NOT NULL,
                 rol TEXT NOT NULL DEFAULT 'Usuario',
                 foto TEXT,
+                correo TEXT,
                 activo INTEGER NOT NULL DEFAULT 1,
                 creado_en TEXT
             )
         """)
+        agregar_columna_si_no_existe(con, "usuarios", "correo", "TEXT")
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS expedientes (
@@ -108,24 +117,61 @@ def crear_tablas():
                 estatus TEXT,
                 proxima_accion TEXT,
                 fecha_limite TEXT,
+                hora_limite TEXT,
                 observaciones TEXT,
                 archivo TEXT,
+                notificar INTEGER DEFAULT 1,
+                creado_en TEXT,
+                FOREIGN KEY(expediente_id) REFERENCES expedientes(id),
+                FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
+            )
+        """)
+        agregar_columna_si_no_existe(con, "movimientos", "hora_limite", "TEXT")
+        agregar_columna_si_no_existe(con, "movimientos", "notificar", "INTEGER DEFAULT 1")
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS audiencias (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                expediente_id INTEGER NOT NULL,
+                usuario_id INTEGER NOT NULL,
+                titulo TEXT NOT NULL,
+                fecha TEXT NOT NULL,
+                hora TEXT NOT NULL,
+                autoridad TEXT,
+                sala TEXT,
+                modalidad TEXT,
+                enlace TEXT,
+                observaciones TEXT,
+                notificar INTEGER DEFAULT 1,
                 creado_en TEXT,
                 FOREIGN KEY(expediente_id) REFERENCES expedientes(id),
                 FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
             )
         """)
 
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS notificaciones_enviadas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tipo TEXT NOT NULL,
+                referencia_id INTEGER NOT NULL,
+                anticipacion TEXT NOT NULL,
+                usuario_id INTEGER NOT NULL,
+                enviado_en TEXT,
+                UNIQUE(tipo, referencia_id, anticipacion, usuario_id)
+            )
+        """)
+
         total = con.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0]
         if total == 0:
             con.execute("""
-                INSERT INTO usuarios (nombre, usuario, password_hash, rol, foto, activo, creado_en)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO usuarios (nombre, usuario, password_hash, rol, foto, correo, activo, creado_en)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 "Administrador General",
                 "admin",
                 generate_password_hash("Admin123*"),
                 "Administrador",
+                "",
                 "",
                 1,
                 datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -161,103 +207,188 @@ def permiso_expediente(expediente_id):
             return None
         if u["rol"] == "Administrador" or exp["propietario_id"] == u["id"]:
             return "Edición"
-        comp = con.execute("""
-            SELECT permiso FROM expedientes_compartidos
-            WHERE expediente_id=? AND usuario_id=?
-        """, (expediente_id, u["id"])).fetchone()
+        comp = con.execute("SELECT permiso FROM expedientes_compartidos WHERE expediente_id=? AND usuario_id=?", (expediente_id, u["id"])).fetchone()
         return comp["permiso"] if comp else None
+
+def usuarios_con_acceso(con, expediente_id):
+    exp = con.execute("SELECT propietario_id FROM expedientes WHERE id=?", (expediente_id,)).fetchone()
+    ids = set()
+    if exp:
+        ids.add(exp["propietario_id"])
+    for r in con.execute("SELECT usuario_id FROM expedientes_compartidos WHERE expediente_id=?", (expediente_id,)).fetchall():
+        ids.add(r["usuario_id"])
+    if not ids:
+        return []
+    placeholders = ",".join(["?"] * len(ids))
+    return con.execute(f"SELECT * FROM usuarios WHERE activo=1 AND id IN ({placeholders})", tuple(ids)).fetchall()
+
+def enviar_correo(destinatario, asunto, cuerpo):
+    smtp_host = os.environ.get("SMTP_HOST", "")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "")
+    from_email = os.environ.get("FROM_EMAIL", smtp_user)
+
+    if not smtp_host or not smtp_user or not smtp_pass or not destinatario:
+        print(f"[SIMULADO] Para: {destinatario} | Asunto: {asunto}\n{cuerpo}\n")
+        return False
+
+    msg = EmailMessage()
+    msg["Subject"] = asunto
+    msg["From"] = from_email
+    msg["To"] = destinatario
+    msg.set_content(cuerpo)
+
+    with smtplib.SMTP(smtp_host, smtp_port) as smtp:
+        smtp.starttls()
+        smtp.login(smtp_user, smtp_pass)
+        smtp.send_message(msg)
+    return True
+
+def revisar_y_enviar_notificaciones():
+    crear_tablas()
+    ahora = datetime.now()
+    ventana_minutos = 10
+    enviados = 0
+
+    with conectar() as con:
+        # Audiencias: 24 horas y 2 horas antes
+        audiencias = con.execute("""
+            SELECT a.*, e.numero, e.tipo
+            FROM audiencias a
+            JOIN expedientes e ON e.id=a.expediente_id
+            WHERE a.notificar=1
+        """).fetchall()
+
+        for a in audiencias:
+            try:
+                fecha_hora = datetime.strptime(a["fecha"] + " " + a["hora"], "%Y-%m-%d %H:%M")
+            except Exception:
+                continue
+
+            for etiqueta, horas in [("24h", 24), ("2h", 2)]:
+                objetivo = fecha_hora - timedelta(hours=horas)
+                diferencia = abs((ahora - objetivo).total_seconds()) / 60
+                if diferencia <= ventana_minutos:
+                    usuarios = usuarios_con_acceso(con, a["expediente_id"])
+                    for u in usuarios:
+                        if not u["correo"]:
+                            continue
+                        ya = con.execute("""
+                            SELECT id FROM notificaciones_enviadas
+                            WHERE tipo='audiencia' AND referencia_id=? AND anticipacion=? AND usuario_id=?
+                        """, (a["id"], etiqueta, u["id"])).fetchone()
+                        if ya:
+                            continue
+                        asunto = f"Recordatorio de audiencia {etiqueta}: expediente {a['numero']}"
+                        cuerpo = f"""LEXCONTROL JURÍDICO
+
+Tienes una audiencia programada.
+
+Expediente: {a['numero']}
+Tipo: {a['tipo']}
+Audiencia: {a['titulo']}
+Fecha: {a['fecha']}
+Hora: {a['hora']}
+Autoridad: {a['autoridad'] or ''}
+Sala: {a['sala'] or ''}
+Modalidad: {a['modalidad'] or ''}
+Enlace: {a['enlace'] or ''}
+Observaciones: {a['observaciones'] or ''}
+
+Este recordatorio se envía con {etiqueta} de anticipación.
+"""
+                        enviar_correo(u["correo"], asunto, cuerpo)
+                        con.execute("""
+                            INSERT OR IGNORE INTO notificaciones_enviadas
+                            (tipo, referencia_id, anticipacion, usuario_id, enviado_en)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, ("audiencia", a["id"], etiqueta, u["id"], ahora.strftime("%Y-%m-%d %H:%M:%S")))
+                        enviados += 1
+
+        # Vencimientos de términos: 24 horas y 2 horas antes
+        movimientos = con.execute("""
+            SELECT m.*, e.numero, e.tipo
+            FROM movimientos m
+            JOIN expedientes e ON e.id=m.expediente_id
+            WHERE m.notificar=1 AND m.fecha_limite IS NOT NULL AND m.fecha_limite != ''
+        """).fetchall()
+
+        for m in movimientos:
+            hora = m["hora_limite"] or "09:00"
+            try:
+                fecha_hora = datetime.strptime(m["fecha_limite"] + " " + hora, "%Y-%m-%d %H:%M")
+            except Exception:
+                continue
+
+            for etiqueta, horas in [("24h", 24), ("2h", 2)]:
+                objetivo = fecha_hora - timedelta(hours=horas)
+                diferencia = abs((ahora - objetivo).total_seconds()) / 60
+                if diferencia <= ventana_minutos:
+                    usuarios = usuarios_con_acceso(con, m["expediente_id"])
+                    for u in usuarios:
+                        if not u["correo"]:
+                            continue
+                        ya = con.execute("""
+                            SELECT id FROM notificaciones_enviadas
+                            WHERE tipo='vencimiento' AND referencia_id=? AND anticipacion=? AND usuario_id=?
+                        """, (m["id"], etiqueta, u["id"])).fetchone()
+                        if ya:
+                            continue
+                        asunto = f"Recordatorio de vencimiento {etiqueta}: expediente {m['numero']}"
+                        cuerpo = f"""LEXCONTROL JURÍDICO
+
+Tienes un vencimiento de término programado.
+
+Expediente: {m['numero']}
+Tipo: {m['tipo']}
+Movimiento: {m['titulo']}
+Fecha límite: {m['fecha_limite']}
+Hora límite: {hora}
+Estatus: {m['estatus'] or ''}
+Próxima acción: {m['proxima_accion'] or ''}
+Observaciones: {m['observaciones'] or ''}
+
+Este recordatorio se envía con {etiqueta} de anticipación.
+"""
+                        enviar_correo(u["correo"], asunto, cuerpo)
+                        con.execute("""
+                            INSERT OR IGNORE INTO notificaciones_enviadas
+                            (tipo, referencia_id, anticipacion, usuario_id, enviado_en)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, ("vencimiento", m["id"], etiqueta, u["id"], ahora.strftime("%Y-%m-%d %H:%M:%S")))
+                        enviados += 1
+
+        con.commit()
+    return enviados
 
 @app.route("/uploads/<path:filename>")
 def uploads(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
 BASE = """
-<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<title>{{config.nombre_sistema}}</title>
+<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>{{config.nombre_sistema}}</title>
 <style>
-:root{
-    --principal: {{config.color_principal or '#0f172a'}};
-    --secundario: {{config.color_secundario or '#1e293b'}};
-    --acento: {{config.color_acento or '#b38b2e'}};
-    --gris:#f3f4f6;
-}
-body{margin:0;font-family:Arial, sans-serif;background:var(--gris);color:#1f2937;}
+:root{--principal:{{config.color_principal or '#0f172a'}};--secundario:{{config.color_secundario or '#1e293b'}};--acento:{{config.color_acento or '#b38b2e'}};--gris:#f3f4f6;}
+body{margin:0;font-family:Arial,sans-serif;background:var(--gris);color:#1f2937;}
 .top{background:var(--principal);color:white;padding:8px 28px;display:flex;justify-content:space-between;font-size:14px;}
-.hero{
-    min-height:220px;
-    background:
-    linear-gradient(rgba(15,23,42,.72),rgba(15,23,42,.72)),
-    {% if config.portada %}url('/uploads/{{config.portada}}'){% else %}linear-gradient(135deg,var(--principal),var(--secundario)){% endif %};
-    background-size:cover;background-position:center;color:white;display:flex;align-items:end;
-    padding:28px 36px;box-sizing:border-box;border-bottom:6px solid var(--acento);
-}
-.brand{display:flex;align-items:center;gap:18px;}
-.logo{width:95px;height:95px;border-radius:50%;border:4px solid white;object-fit:cover;background:white;}
-.brand h1{margin:0;font-size:34px;letter-spacing:.5px;}
-.brand p{margin:6px 0 0;opacity:.92;}
-nav{background:var(--secundario);padding:12px 30px;}
-nav a{color:white;text-decoration:none;margin-right:16px;font-weight:bold;font-size:14px;}
-nav a:hover{color:#fde68a;}
-main{padding:25px 30px;}
-.card{background:white;padding:22px;border-radius:12px;margin-bottom:20px;box-shadow:0 2px 12px rgba(15,23,42,.1);border-top:3px solid var(--acento);}
-input,select,textarea{width:100%;padding:11px;margin:6px 0 13px;border:1px solid #cbd5e1;border-radius:7px;box-sizing:border-box;font-size:14px;}
-label{font-weight:bold;font-size:14px;}
-button,.btn{background:var(--principal);color:white;border:0;padding:10px 16px;border-radius:7px;text-decoration:none;display:inline-block;font-weight:bold;cursor:pointer;}
-.btn2{background:#475569}.btnGold{background:#9a6f14}.btnGreen{background:#166534}.btnRed{background:#991b1b}
-table{width:100%;border-collapse:collapse;background:white;} th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;vertical-align:top;} th{background:#e2e8f0;color:#0f172a;}
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}.grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:15px}
-.stat{background:white;padding:20px;border-radius:12px;text-align:center;box-shadow:0 2px 12px rgba(15,23,42,.1);border-bottom:4px solid var(--acento);}
-.stat h2{font-size:34px;margin:0;color:var(--principal);}
-.tag{padding:5px 9px;border-radius:999px;font-size:12px;font-weight:bold;display:inline-block;}
-.En-trámite,.Pendiente,.Lectura{background:#fef3c7}.Urgente,.Vencido{background:#fecaca}.Concluido,.Acordado,.Edición{background:#bbf7d0}.Presentado{background:#bfdbfe}
-.flash{background:#dcfce7;border-left:5px solid #166534;padding:10px;border-radius:7px;margin-bottom:12px;}
-.login{max-width:430px;margin:35px auto}.preview{max-width:260px;max-height:150px;border:1px solid #ddd;border-radius:8px;display:block;margin:8px 0 15px;}
-.small{font-size:13px;color:#64748b}
+.userbox{display:flex;align-items:center;gap:8px}.userphoto{width:28px;height:28px;border-radius:50%;object-fit:cover;background:white;border:1px solid rgba(255,255,255,.8);}
+.hero{min-height:220px;background:linear-gradient(rgba(15,23,42,.72),rgba(15,23,42,.72)),{% if config.portada %}url('/uploads/{{config.portada}}'){% else %}linear-gradient(135deg,var(--principal),var(--secundario)){% endif %};background-size:cover;background-position:center;color:white;display:flex;align-items:end;padding:28px 36px;box-sizing:border-box;border-bottom:6px solid var(--acento);}
+.brand{display:flex;align-items:center;gap:18px}.logo{width:95px;height:95px;border-radius:50%;border:4px solid white;object-fit:cover;background:white}.brand h1{margin:0;font-size:34px}.brand p{margin:6px 0 0;opacity:.92}
+nav{background:var(--secundario);padding:12px 30px}nav a{color:white;text-decoration:none;margin-right:16px;font-weight:bold;font-size:14px}nav a:hover{color:#fde68a}
+main{padding:25px 30px}.card{background:white;padding:22px;border-radius:12px;margin-bottom:20px;box-shadow:0 2px 12px rgba(15,23,42,.1);border-top:3px solid var(--acento)}
+input,select,textarea{width:100%;padding:11px;margin:6px 0 13px;border:1px solid #cbd5e1;border-radius:7px;box-sizing:border-box;font-size:14px}label{font-weight:bold;font-size:14px}
+button,.btn{background:var(--principal);color:white;border:0;padding:10px 16px;border-radius:7px;text-decoration:none;display:inline-block;font-weight:bold;cursor:pointer}.btn2{background:#475569}.btnGold{background:#9a6f14}.btnGreen{background:#166534}.btnRed{background:#991b1b}
+table{width:100%;border-collapse:collapse;background:white}th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;vertical-align:top}th{background:#e2e8f0;color:#0f172a}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}.grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:15px}.stat{background:white;padding:20px;border-radius:12px;text-align:center;box-shadow:0 2px 12px rgba(15,23,42,.1);border-bottom:4px solid var(--acento)}.stat h2{font-size:34px;margin:0;color:var(--principal)}
+.tag{padding:5px 9px;border-radius:999px;font-size:12px;font-weight:bold;display:inline-block}.En-trámite,.Pendiente,.Lectura{background:#fef3c7}.Urgente,.Vencido{background:#fecaca}.Concluido,.Acordado,.Edición{background:#bbf7d0}.Presentado{background:#bfdbfe}
+.flash{background:#dcfce7;border-left:5px solid #166534;padding:10px;border-radius:7px;margin-bottom:12px}.login{max-width:430px;margin:35px auto}.preview{max-width:260px;max-height:150px;border:1px solid #ddd;border-radius:8px;display:block;margin:8px 0 15px}.profile-big{width:130px;height:130px;border-radius:50%;object-fit:cover;border:4px solid var(--acento);background:#e5e7eb}.small{font-size:13px;color:#64748b}
 @media(max-width:900px){.grid,.grid2{grid-template-columns:1fr}nav a{display:inline-block;margin-bottom:8px}table{font-size:13px}}
-</style>
-</head>
-<body>
-<div class="top">
-    <div>Sistema jurídico privado</div>
-    <div>
-    {% if usuario %}
-        {{usuario.nombre}} | {{usuario.rol}} | <a href="/logout" style="color:white">Salir</a>
-    {% else %}
-        Acceso restringido
-    {% endif %}
-    </div>
-</div>
-<section class="hero">
-    <div class="brand">
-        {% if config.logo %}<img class="logo" src="/uploads/{{config.logo}}">{% else %}<div class="logo"></div>{% endif %}
-        <div><h1>{{config.nombre_sistema}}</h1><p>{{config.subtitulo}}</p></div>
-    </div>
-</section>
-{% if usuario %}
-<nav>
-    <a href="/">Inicio</a>
-    <a href="/expedientes">Mis expedientes</a>
-    <a href="/compartidos">Compartidos conmigo</a>
-    <a href="/nuevo">Nuevo expediente</a>
-    <a href="/vencimientos">Vencimientos</a>
-    <a href="/jurisprudencia">Jurisprudencia / Enlaces</a>
-    {% if usuario.rol == 'Administrador' %}
-        <a href="/usuarios">Usuarios</a>
-        <a href="/configuracion">Visual / Imágenes</a>
-    {% endif %}
-</nav>
-{% endif %}
-<main>
-{% with messages=get_flashed_messages() %}
-{% for message in messages %}<div class="flash">{{message}}</div>{% endfor %}
-{% endwith %}
-{{contenido|safe}}
-</main>
-</body>
-</html>
+</style></head><body>
+<div class="top"><div>Sistema jurídico privado</div><div>{% if usuario %}<div class="userbox">{% if usuario.foto %}<img class="userphoto" src="/uploads/{{usuario.foto}}">{% endif %}<span>{{usuario.nombre}} | {{usuario.rol}} | <a href="/logout" style="color:white">Salir</a></span></div>{% else %}Acceso restringido{% endif %}</div></div>
+<section class="hero"><div class="brand">{% if config.logo %}<img class="logo" src="/uploads/{{config.logo}}">{% else %}<div class="logo"></div>{% endif %}<div><h1>{{config.nombre_sistema}}</h1><p>{{config.subtitulo}}</p></div></div></section>
+{% if usuario %}<nav><a href="/">Inicio</a><a href="/perfil">Mi perfil</a><a href="/expedientes">Mis expedientes</a><a href="/compartidos">Compartidos conmigo</a><a href="/nuevo">Nuevo expediente</a><a href="/audiencias">Audiencias</a><a href="/vencimientos">Vencimientos</a><a href="/jurisprudencia">Jurisprudencia / Enlaces</a>{% if usuario.rol == 'Administrador' %}<a href="/usuarios">Usuarios</a><a href="/configuracion">Visual / Imágenes</a><a href="/notificaciones">Notificaciones</a>{% endif %}</nav>{% endif %}
+<main>{% with messages=get_flashed_messages() %}{% for message in messages %}<div class="flash">{{message}}</div>{% endfor %}{% endwith %}{{contenido|safe}}</main></body></html>
 """
 
 def render(contenido, **kwargs):
@@ -276,15 +407,9 @@ def login():
             return redirect(url_for("inicio"))
         flash("Usuario o contraseña incorrectos.")
     contenido = """
-    <div class="card login">
-        <h2>Iniciar sesión</h2>
-        <form method="post">
-            <label>Usuario</label><input name="usuario" required>
-            <label>Contraseña</label><input type="password" name="password" required>
-            <button>Entrar</button>
-        </form>
-        <p class="small"><b>Administrador inicial:</b> usuario <b>admin</b> / contraseña <b>Admin123*</b></p>
-    </div>
+    <div class="card login"><h2>Iniciar sesión</h2>
+    <form method="post"><label>Usuario</label><input name="usuario" required autocomplete="username"><label>Contraseña</label><input type="password" name="password" required autocomplete="current-password"><button>Entrar</button></form>
+    <p class="small">Acceso exclusivo para usuarios registrados por el administrador.</p></div>
     """
     return render(contenido)
 
@@ -293,6 +418,34 @@ def logout():
     session.clear()
     return redirect(url_for("login"))
 
+@app.route("/perfil", methods=["GET","POST"])
+def perfil():
+    if not requiere_login(): return redirect(url_for("login"))
+    u = usuario_actual()
+    if request.method == "POST":
+        foto_actual = u["foto"] or ""
+        foto = request.files.get("foto")
+        if foto and foto.filename:
+            if not permitido(foto.filename, ALLOWED_IMAGES):
+                flash("La foto debe ser una imagen PNG, JPG, JPEG, GIF o WEBP.")
+                return redirect(url_for("perfil"))
+            foto_actual = "perfil_usuario_" + str(u["id"]) + "_" + datetime.now().strftime("%Y%m%d%H%M%S_") + secure_filename(foto.filename)
+            foto.save(UPLOAD_FOLDER / foto_actual)
+        nuevo_password = request.form.get("password", "").strip()
+        with conectar() as con:
+            if nuevo_password:
+                con.execute("UPDATE usuarios SET nombre=?, correo=?, foto=?, password_hash=? WHERE id=?", (request.form["nombre"], request.form["correo"], foto_actual, generate_password_hash(nuevo_password), u["id"]))
+            else:
+                con.execute("UPDATE usuarios SET nombre=?, correo=?, foto=? WHERE id=?", (request.form["nombre"], request.form["correo"], foto_actual, u["id"]))
+            con.commit()
+        flash("Perfil actualizado correctamente.")
+        return redirect(url_for("perfil"))
+    contenido = """
+    <div class="card"><h2>Mi perfil</h2><div class="grid2"><div>{% if u.foto %}<img class="profile-big" src="/uploads/{{u.foto}}">{% else %}<div class="profile-big"></div>{% endif %}<p><b>Usuario:</b> {{u.usuario}}</p><p><b>Rol:</b> {{u.rol}}</p><p><b>Correo:</b> {{u.correo or 'Sin correo registrado'}}</p></div>
+    <div><form method="post" enctype="multipart/form-data"><label>Nombre completo</label><input name="nombre" value="{{u.nombre}}" required><label>Correo electrónico para notificaciones</label><input type="email" name="correo" value="{{u.correo or ''}}" placeholder="correo@ejemplo.com"><label>Fotografía de usuario</label><input type="file" name="foto" accept="image/*"><label>Nueva contraseña</label><input type="password" name="password" placeholder="Dejar vacío si no deseas cambiarla"><button>Guardar perfil</button></form></div></div></div>
+    """
+    return render(contenido, u=u)
+
 @app.route("/")
 def inicio():
     if not requiere_login(): return redirect(url_for("login"))
@@ -300,40 +453,26 @@ def inicio():
     with conectar() as con:
         propios = con.execute("SELECT COUNT(*) FROM expedientes WHERE propietario_id=?", (u["id"],)).fetchone()[0]
         compartidos = con.execute("SELECT COUNT(*) FROM expedientes_compartidos WHERE usuario_id=?", (u["id"],)).fetchone()[0]
+        audiencias = con.execute("""
+            SELECT COUNT(*) FROM audiencias a
+            JOIN expedientes e ON e.id=a.expediente_id
+            LEFT JOIN expedientes_compartidos c ON c.expediente_id=e.id
+            WHERE (e.propietario_id=? OR c.usuario_id=? OR ?='Administrador')
+        """, (u["id"], u["id"], u["rol"])).fetchone()[0]
         if u["rol"] == "Administrador":
             total = con.execute("SELECT COUNT(*) FROM expedientes").fetchone()[0]
             urgentes = con.execute("SELECT COUNT(*) FROM expedientes WHERE estado='Urgente'").fetchone()[0]
-            recientes = con.execute("""SELECT e.*, us.nombre propietario FROM expedientes e JOIN usuarios us ON us.id=e.propietario_id ORDER BY e.id DESC LIMIT 8""").fetchall()
+            recientes = con.execute("SELECT e.*, us.nombre propietario FROM expedientes e JOIN usuarios us ON us.id=e.propietario_id ORDER BY e.id DESC LIMIT 8").fetchall()
         else:
             total = propios + compartidos
             urgentes = con.execute("SELECT COUNT(*) FROM expedientes WHERE propietario_id=? AND estado='Urgente'", (u["id"],)).fetchone()[0]
-            recientes = con.execute("""SELECT e.*, us.nombre propietario FROM expedientes e JOIN usuarios us ON us.id=e.propietario_id WHERE e.propietario_id=? ORDER BY e.id DESC LIMIT 8""", (u["id"],)).fetchall()
+            recientes = con.execute("SELECT e.*, us.nombre propietario FROM expedientes e JOIN usuarios us ON us.id=e.propietario_id WHERE e.propietario_id=? ORDER BY e.id DESC LIMIT 8", (u["id"],)).fetchall()
     contenido = """
-    <div class="grid">
-        <div class="stat"><h2>{{total}}</h2><p>Expedientes visibles</p></div>
-        <div class="stat"><h2>{{propios}}</h2><p>Mis expedientes</p></div>
-        <div class="stat"><h2>{{compartidos}}</h2><p>Compartidos conmigo</p></div>
-        <div class="stat"><h2>{{urgentes}}</h2><p>Urgentes</p></div>
-    </div><br>
-    <div class="card">
-        <h2>Accesos jurídicos rápidos</h2>
-        <a class="btn btnGold" target="_blank" href="{{SCJN_BUSCADOR}}">Buscador Jurídico SCJN</a>
-        <a class="btn btnGold" target="_blank" href="{{SCJN_TESIS}}">Semanario Judicial / Tesis</a>
-        <a class="btn btn2" target="_blank" href="{{BOLETIN_PJBC}}">Boletín Judicial BC</a>
-        <a class="btn btn2" target="_blank" href="{{PJBC_PORTAL}}">Poder Judicial BC</a>
-        <a class="btn btn2" target="_blank" href="{{TEJA_BC}}">TEJA BC</a>
-        <a class="btn btn2" target="_blank" href="{{TEJA_LISTAS}}">Listas TEJA</a>
-    </div>
-    <div class="card">
-        <h2>Últimos expedientes</h2>
-        <table><tr><th>Expediente</th><th>Tipo</th><th>Autoridad</th><th>Estado</th><th>Propietario</th><th>Acción</th></tr>
-        {% for e in recientes %}
-        <tr><td>{{e.numero}}</td><td>{{e.tipo}}</td><td>{{e.autoridad}}</td><td><span class="tag {{e.estado.replace(' ','-')}}">{{e.estado}}</span></td><td>{{e.propietario}}</td><td><a class="btn btn2" href="/expediente/{{e.id}}">Abrir</a></td></tr>
-        {% endfor %}
-        </table>
-    </div>
+    <div class="grid"><div class="stat"><h2>{{total}}</h2><p>Expedientes visibles</p></div><div class="stat"><h2>{{propios}}</h2><p>Mis expedientes</p></div><div class="stat"><h2>{{audiencias}}</h2><p>Audiencias</p></div><div class="stat"><h2>{{urgentes}}</h2><p>Urgentes</p></div></div><br>
+    <div class="card"><h2>Accesos jurídicos rápidos</h2><a class="btn btnGold" target="_blank" href="{{SCJN_BUSCADOR}}">Buscador Jurídico SCJN</a> <a class="btn btnGold" target="_blank" href="{{SCJN_TESIS}}">Semanario Judicial / Tesis</a> <a class="btn btn2" target="_blank" href="{{BOLETIN_PJBC}}">Boletín Judicial BC</a> <a class="btn btn2" target="_blank" href="{{PJBC_PORTAL}}">Poder Judicial BC</a> <a class="btn btn2" target="_blank" href="{{TEJA_BC}}">TEJA BC</a> <a class="btn btn2" target="_blank" href="{{TEJA_LISTAS}}">Listas TEJA</a></div>
+    <div class="card"><h2>Últimos expedientes</h2><table><tr><th>Expediente</th><th>Tipo</th><th>Autoridad</th><th>Estado</th><th>Propietario</th><th>Acción</th></tr>{% for e in recientes %}<tr><td>{{e.numero}}</td><td>{{e.tipo}}</td><td>{{e.autoridad}}</td><td><span class="tag {{e.estado.replace(' ','-')}}">{{e.estado}}</span></td><td>{{e.propietario}}</td><td><a class="btn btn2" href="/expediente/{{e.id}}">Abrir</a></td></tr>{% endfor %}</table></div>
     """
-    return render(contenido, total=total, propios=propios, compartidos=compartidos, urgentes=urgentes, recientes=recientes, SCJN_BUSCADOR=SCJN_BUSCADOR, SCJN_TESIS=SCJN_TESIS, BOLETIN_PJBC=BOLETIN_PJBC, PJBC_PORTAL=PJBC_PORTAL, TEJA_BC=TEJA_BC, TEJA_LISTAS=TEJA_LISTAS)
+    return render(contenido, total=total, propios=propios, compartidos=compartidos, urgentes=urgentes, recientes=recientes, audiencias=audiencias, SCJN_BUSCADOR=SCJN_BUSCADOR, SCJN_TESIS=SCJN_TESIS, BOLETIN_PJBC=BOLETIN_PJBC, PJBC_PORTAL=PJBC_PORTAL, TEJA_BC=TEJA_BC, TEJA_LISTAS=TEJA_LISTAS)
 
 @app.route("/usuarios", methods=["GET","POST"])
 def usuarios():
@@ -356,8 +495,7 @@ def usuarios():
                 foto_nombre = "usuario_" + datetime.now().strftime("%Y%m%d%H%M%S_") + secure_filename(foto.filename)
                 foto.save(UPLOAD_FOLDER / foto_nombre)
             try:
-                con.execute("""INSERT INTO usuarios(nombre,usuario,password_hash,rol,foto,activo,creado_en) VALUES(?,?,?,?,?,1,?)""",
-                    (request.form["nombre"], request.form["usuario"], generate_password_hash(request.form["password"]), request.form["rol"], foto_nombre, datetime.now().strftime("%Y-%m-%d %H:%M")))
+                con.execute("INSERT INTO usuarios(nombre,usuario,password_hash,rol,foto,correo,activo,creado_en) VALUES(?,?,?,?,?,?,1,?)", (request.form["nombre"], request.form["usuario"], generate_password_hash(request.form["password"]), request.form["rol"], foto_nombre, request.form["correo"], datetime.now().strftime("%Y-%m-%d %H:%M")))
                 con.commit()
                 flash("Usuario creado correctamente.")
             except sqlite3.IntegrityError:
@@ -367,25 +505,8 @@ def usuarios():
         datos = con.execute("SELECT * FROM usuarios ORDER BY id").fetchall()
         total = con.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0]
     contenido = """
-    <div class="grid2">
-    <div class="card">
-        <h2>Crear usuario</h2>
-        <p>Registrados: <b>{{total}}</b> de <b>15</b>.</p>
-        <form method="post" enctype="multipart/form-data">
-            <label>Nombre completo</label><input name="nombre" required>
-            <label>Usuario</label><input name="usuario" required>
-            <label>Contraseña</label><input type="password" name="password" required>
-            <label>Rol</label><select name="rol"><option>Usuario</option><option>Administrador</option></select>
-            <label>Foto de perfil</label><input type="file" name="foto" accept="image/*">
-            <button>Crear usuario</button>
-        </form>
-    </div>
-    <div class="card">
-        <h2>Usuarios</h2>
-        <table><tr><th>ID</th><th>Nombre</th><th>Usuario</th><th>Rol</th></tr>
-        {% for u in datos %}<tr><td>{{u.id}}</td><td>{{u.nombre}}</td><td>{{u.usuario}}</td><td>{{u.rol}}</td></tr>{% endfor %}
-        </table>
-    </div></div>
+    <div class="grid2"><div class="card"><h2>Crear usuario</h2><p>Registrados: <b>{{total}}</b> de <b>15</b>.</p><form method="post" enctype="multipart/form-data"><label>Nombre completo</label><input name="nombre" required><label>Usuario</label><input name="usuario" required><label>Correo electrónico</label><input type="email" name="correo" placeholder="correo@ejemplo.com"><label>Contraseña</label><input type="password" name="password" required><label>Rol</label><select name="rol"><option>Usuario</option><option>Administrador</option></select><label>Foto inicial de perfil</label><input type="file" name="foto" accept="image/*"><button>Crear usuario</button></form></div>
+    <div class="card"><h2>Usuarios registrados</h2><table><tr><th>Foto</th><th>ID</th><th>Nombre</th><th>Usuario</th><th>Correo</th><th>Rol</th></tr>{% for u in datos %}<tr><td>{% if u.foto %}<img class="userphoto" src="/uploads/{{u.foto}}">{% endif %}</td><td>{{u.id}}</td><td>{{u.nombre}}</td><td>{{u.usuario}}</td><td>{{u.correo}}</td><td>{{u.rol}}</td></tr>{% endfor %}</table></div></div>
     """
     return render(contenido, datos=datos, total=total)
 
@@ -414,25 +535,12 @@ def configuracion():
             logo_actual = "logo_" + datetime.now().strftime("%Y%m%d%H%M%S_") + secure_filename(logo.filename)
             logo.save(UPLOAD_FOLDER / logo_actual)
         with conectar() as con:
-            con.execute("""UPDATE configuracion SET nombre_sistema=?, subtitulo=?, portada=?, logo=?, color_principal=?, color_secundario=?, color_acento=? WHERE id=1""",
-                (request.form["nombre_sistema"], request.form["subtitulo"], portada_actual, logo_actual, request.form["color_principal"], request.form["color_secundario"], request.form["color_acento"]))
+            con.execute("UPDATE configuracion SET nombre_sistema=?, subtitulo=?, portada=?, logo=?, color_principal=?, color_secundario=?, color_acento=? WHERE id=1", (request.form["nombre_sistema"], request.form["subtitulo"], portada_actual, logo_actual, request.form["color_principal"], request.form["color_secundario"], request.form["color_acento"]))
             con.commit()
         flash("Diseño actualizado correctamente.")
         return redirect(url_for("inicio"))
     contenido = """
-    <div class="card">
-        <h2>Modificar programa / visual / imágenes</h2>
-        <form method="post" enctype="multipart/form-data">
-            <label>Nombre del sistema</label><input name="nombre_sistema" value="{{config.nombre_sistema}}" required>
-            <label>Subtítulo</label><input name="subtitulo" value="{{config.subtitulo}}">
-            <label>Color principal</label><input type="color" name="color_principal" value="{{config.color_principal or '#0f172a'}}">
-            <label>Color secundario</label><input type="color" name="color_secundario" value="{{config.color_secundario or '#1e293b'}}">
-            <label>Color acento</label><input type="color" name="color_acento" value="{{config.color_acento or '#b38b2e'}}">
-            <label>Imagen de portada</label>{% if config.portada %}<img class="preview" src="/uploads/{{config.portada}}">{% endif %}<input type="file" name="portada" accept="image/*">
-            <label>Logo / foto de perfil del sistema</label>{% if config.logo %}<img class="preview" src="/uploads/{{config.logo}}">{% endif %}<input type="file" name="logo" accept="image/*">
-            <button>Guardar diseño</button>
-        </form>
-    </div>
+    <div class="card"><h2>Modificar programa / visual / imágenes</h2><form method="post" enctype="multipart/form-data"><label>Nombre del sistema</label><input name="nombre_sistema" value="{{config.nombre_sistema}}" required><label>Subtítulo</label><input name="subtitulo" value="{{config.subtitulo}}"><label>Color principal</label><input type="color" name="color_principal" value="{{config.color_principal or '#0f172a'}}"><label>Color secundario</label><input type="color" name="color_secundario" value="{{config.color_secundario or '#1e293b'}}"><label>Color acento</label><input type="color" name="color_acento" value="{{config.color_acento or '#b38b2e'}}"><label>Imagen de portada</label>{% if config.portada %}<img class="preview" src="/uploads/{{config.portada}}">{% endif %}<input type="file" name="portada" accept="image/*"><label>Logo / foto del sistema</label>{% if config.logo %}<img class="preview" src="/uploads/{{config.logo}}">{% endif %}<input type="file" name="logo" accept="image/*"><button>Guardar diseño</button></form></div>
     """
     return render(contenido, config=config)
 
@@ -442,25 +550,12 @@ def nuevo():
     u = usuario_actual()
     if request.method == "POST":
         with conectar() as con:
-            con.execute("""INSERT INTO expedientes(propietario_id,numero,tipo,autoridad,actor,demandado,estado,responsable,fecha_inicio,observaciones,creado_en) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (u["id"], request.form["numero"], request.form["tipo"], request.form["autoridad"], request.form["actor"], request.form["demandado"], request.form["estado"], request.form["responsable"], request.form["fecha_inicio"], request.form["observaciones"], datetime.now().strftime("%Y-%m-%d %H:%M")))
+            con.execute("INSERT INTO expedientes(propietario_id,numero,tipo,autoridad,actor,demandado,estado,responsable,fecha_inicio,observaciones,creado_en) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (u["id"], request.form["numero"], request.form["tipo"], request.form["autoridad"], request.form["actor"], request.form["demandado"], request.form["estado"], request.form["responsable"], request.form["fecha_inicio"], request.form["observaciones"], datetime.now().strftime("%Y-%m-%d %H:%M")))
             con.commit()
         flash("Expediente guardado en tu espacio.")
         return redirect(url_for("expedientes"))
     contenido = """
-    <div class="card"><h2>Nuevo expediente</h2>
-    <form method="post">
-        <label>Número de expediente</label><input name="numero" required>
-        <label>Tipo</label><select name="tipo"><option>Laboral</option><option>Penal</option><option>Administrativo</option><option>Civil</option><option>Mercantil</option><option>Amparo</option><option>Familiar</option><option>Otro</option></select>
-        <label>Autoridad / juzgado / tribunal</label><input name="autoridad">
-        <label>Actor / denunciante</label><input name="actor">
-        <label>Demandado / imputado</label><input name="demandado">
-        <label>Estado</label><select name="estado"><option>En trámite</option><option>Pendiente</option><option>Urgente</option><option>Concluido</option></select>
-        <label>Responsable</label><input name="responsable">
-        <label>Fecha de inicio</label><input type="date" name="fecha_inicio">
-        <label>Observaciones</label><textarea name="observaciones" rows="4"></textarea>
-        <button>Guardar</button>
-    </form></div>
+    <div class="card"><h2>Nuevo expediente</h2><form method="post"><label>Número de expediente</label><input name="numero" required><label>Tipo</label><select name="tipo"><option>Laboral</option><option>Penal</option><option>Administrativo</option><option>Civil</option><option>Mercantil</option><option>Amparo</option><option>Familiar</option><option>Otro</option></select><label>Autoridad / juzgado / tribunal</label><input name="autoridad"><label>Actor / denunciante</label><input name="actor"><label>Demandado / imputado</label><input name="demandado"><label>Estado</label><select name="estado"><option>En trámite</option><option>Pendiente</option><option>Urgente</option><option>Concluido</option></select><label>Responsable</label><input name="responsable"><label>Fecha de inicio</label><input type="date" name="fecha_inicio"><label>Observaciones</label><textarea name="observaciones" rows="4"></textarea><button>Guardar</button></form></div>
     """
     return render(contenido)
 
@@ -472,15 +567,11 @@ def expedientes():
     like=f"%{q}%"
     with conectar() as con:
         if u["rol"]=="Administrador":
-            datos=con.execute("""SELECT e.*,us.nombre propietario FROM expedientes e JOIN usuarios us ON us.id=e.propietario_id WHERE ?='' OR e.numero LIKE ? OR e.tipo LIKE ? OR e.autoridad LIKE ? OR e.actor LIKE ? OR e.demandado LIKE ? ORDER BY e.id DESC""",(q,like,like,like,like,like)).fetchall()
+            datos=con.execute("SELECT e.*,us.nombre propietario FROM expedientes e JOIN usuarios us ON us.id=e.propietario_id WHERE ?='' OR e.numero LIKE ? OR e.tipo LIKE ? OR e.autoridad LIKE ? OR e.actor LIKE ? OR e.demandado LIKE ? ORDER BY e.id DESC",(q,like,like,like,like,like)).fetchall()
         else:
-            datos=con.execute("""SELECT e.*,us.nombre propietario FROM expedientes e JOIN usuarios us ON us.id=e.propietario_id WHERE e.propietario_id=? AND (?='' OR e.numero LIKE ? OR e.tipo LIKE ? OR e.autoridad LIKE ? OR e.actor LIKE ? OR e.demandado LIKE ?) ORDER BY e.id DESC""",(u["id"],q,like,like,like,like,like)).fetchall()
+            datos=con.execute("SELECT e.*,us.nombre propietario FROM expedientes e JOIN usuarios us ON us.id=e.propietario_id WHERE e.propietario_id=? AND (?='' OR e.numero LIKE ? OR e.tipo LIKE ? OR e.autoridad LIKE ? OR e.actor LIKE ? OR e.demandado LIKE ?) ORDER BY e.id DESC",(u["id"],q,like,like,like,like,like)).fetchall()
     contenido = """
-    <div class="card"><h2>Mis expedientes</h2>
-    <form><input name="q" value="{{q}}" placeholder="Buscar expediente"><button>Buscar</button> <a class="btn btn2" href="/expedientes">Limpiar</a></form><br>
-    <table><tr><th>Número</th><th>Tipo</th><th>Autoridad</th><th>Estado</th><th>Propietario</th><th>Acción</th></tr>
-    {% for e in datos %}<tr><td>{{e.numero}}</td><td>{{e.tipo}}</td><td>{{e.autoridad}}</td><td><span class="tag {{e.estado.replace(' ','-')}}">{{e.estado}}</span></td><td>{{e.propietario}}</td><td><a class="btn btn2" href="/expediente/{{e.id}}">Abrir</a></td></tr>{% endfor %}
-    </table></div>
+    <div class="card"><h2>Mis expedientes</h2><form><input name="q" value="{{q}}" placeholder="Buscar expediente"><button>Buscar</button> <a class="btn btn2" href="/expedientes">Limpiar</a></form><br><table><tr><th>Número</th><th>Tipo</th><th>Autoridad</th><th>Estado</th><th>Propietario</th><th>Acción</th></tr>{% for e in datos %}<tr><td>{{e.numero}}</td><td>{{e.tipo}}</td><td>{{e.autoridad}}</td><td><span class="tag {{e.estado.replace(' ','-')}}">{{e.estado}}</span></td><td>{{e.propietario}}</td><td><a class="btn btn2" href="/expediente/{{e.id}}">Abrir</a></td></tr>{% endfor %}</table></div>
     """
     return render(contenido, datos=datos, q=q)
 
@@ -489,12 +580,9 @@ def compartidos():
     if not requiere_login(): return redirect(url_for("login"))
     u=usuario_actual()
     with conectar() as con:
-        datos=con.execute("""SELECT e.*,c.permiso,us.nombre propietario FROM expedientes_compartidos c JOIN expedientes e ON e.id=c.expediente_id JOIN usuarios us ON us.id=e.propietario_id WHERE c.usuario_id=? ORDER BY c.id DESC""",(u["id"],)).fetchall()
+        datos=con.execute("SELECT e.*,c.permiso,us.nombre propietario FROM expedientes_compartidos c JOIN expedientes e ON e.id=c.expediente_id JOIN usuarios us ON us.id=e.propietario_id WHERE c.usuario_id=? ORDER BY c.id DESC",(u["id"],)).fetchall()
     contenido = """
-    <div class="card"><h2>Compartidos conmigo</h2>
-    <table><tr><th>Número</th><th>Tipo</th><th>Autoridad</th><th>Estado</th><th>Propietario</th><th>Permiso</th><th>Acción</th></tr>
-    {% for e in datos %}<tr><td>{{e.numero}}</td><td>{{e.tipo}}</td><td>{{e.autoridad}}</td><td><span class="tag {{e.estado.replace(' ','-')}}">{{e.estado}}</span></td><td>{{e.propietario}}</td><td><span class="tag {{e.permiso}}">{{e.permiso}}</span></td><td><a class="btn btn2" href="/expediente/{{e.id}}">Abrir</a></td></tr>{% endfor %}
-    </table></div>
+    <div class="card"><h2>Compartidos conmigo</h2><table><tr><th>Número</th><th>Tipo</th><th>Autoridad</th><th>Estado</th><th>Propietario</th><th>Permiso</th><th>Acción</th></tr>{% for e in datos %}<tr><td>{{e.numero}}</td><td>{{e.tipo}}</td><td>{{e.autoridad}}</td><td><span class="tag {{e.estado.replace(' ','-')}}">{{e.estado}}</span></td><td>{{e.propietario}}</td><td><span class="tag {{e.permiso}}">{{e.permiso}}</span></td><td><a class="btn btn2" href="/expediente/{{e.id}}">Abrir</a></td></tr>{% endfor %}</table></div>
     """
     return render(contenido, datos=datos)
 
@@ -506,21 +594,17 @@ def expediente(id):
         flash("No tienes acceso a ese expediente.")
         return redirect(url_for("inicio"))
     with conectar() as con:
-        e=con.execute("""SELECT e.*,us.nombre propietario FROM expedientes e JOIN usuarios us ON us.id=e.propietario_id WHERE e.id=?""",(id,)).fetchone()
-        movs=con.execute("""SELECT m.*,us.nombre autor FROM movimientos m JOIN usuarios us ON us.id=m.usuario_id WHERE m.expediente_id=? ORDER BY m.id DESC""",(id,)).fetchall()
-        compart=con.execute("""SELECT c.*,us.nombre,us.usuario FROM expedientes_compartidos c JOIN usuarios us ON us.id=c.usuario_id WHERE c.expediente_id=?""",(id,)).fetchall()
+        e=con.execute("SELECT e.*,us.nombre propietario FROM expedientes e JOIN usuarios us ON us.id=e.propietario_id WHERE e.id=?",(id,)).fetchone()
+        movs=con.execute("SELECT m.*,us.nombre autor FROM movimientos m JOIN usuarios us ON us.id=m.usuario_id WHERE m.expediente_id=? ORDER BY m.id DESC",(id,)).fetchall()
+        auds=con.execute("SELECT a.*,us.nombre autor FROM audiencias a JOIN usuarios us ON us.id=a.usuario_id WHERE a.expediente_id=? ORDER BY a.fecha ASC, a.hora ASC",(id,)).fetchall()
+        compart=con.execute("SELECT c.*,us.nombre,us.usuario,us.foto FROM expedientes_compartidos c JOIN usuarios us ON us.id=c.usuario_id WHERE c.expediente_id=?",(id,)).fetchall()
     contenido = """
-    <div class="card">
-    <h2>Expediente {{e.numero}}</h2>
-    <p><b>Propietario:</b> {{e.propietario}}</p><p><b>Tipo:</b> {{e.tipo}}</p><p><b>Autoridad:</b> {{e.autoridad}}</p><p><b>Actor:</b> {{e.actor}}</p><p><b>Demandado:</b> {{e.demandado}}</p><p><b>Estado:</b> <span class="tag {{e.estado.replace(' ','-')}}">{{e.estado}}</span></p><p><b>Observaciones:</b> {{e.observaciones}}</p>
-    {% if permiso == 'Edición' %}<a class="btn" href="/movimiento/{{e.id}}">Agregar promoción</a> <a class="btn btnGold" href="/compartir/{{e.id}}">Compartir</a>{% endif %}
-    </div>
-    <div class="grid2"><div class="card"><h2>Historial</h2>
-    <table><tr><th>Título</th><th>Fecha</th><th>Estatus</th><th>Límite</th><th>Archivo</th><th>Autor</th></tr>
-    {% for m in movs %}<tr><td>{{m.titulo}}<br><small>{{m.observaciones}}</small></td><td>{{m.fecha}}</td><td><span class="tag {{m.estatus.replace(' ','-')}}">{{m.estatus}}</span></td><td>{{m.fecha_limite}}</td><td>{% if m.archivo %}<a target="_blank" href="/uploads/{{m.archivo}}">Ver</a>{% endif %}</td><td>{{m.autor}}</td></tr>{% endfor %}
-    </table></div><div class="card"><h2>Compartido con</h2><table><tr><th>Nombre</th><th>Usuario</th><th>Permiso</th></tr>{% for c in compart %}<tr><td>{{c.nombre}}</td><td>{{c.usuario}}</td><td><span class="tag {{c.permiso}}">{{c.permiso}}</span></td></tr>{% endfor %}</table></div></div>
+    <div class="card"><h2>Expediente {{e.numero}}</h2><p><b>Propietario:</b> {{e.propietario}}</p><p><b>Tipo:</b> {{e.tipo}}</p><p><b>Autoridad:</b> {{e.autoridad}}</p><p><b>Actor:</b> {{e.actor}}</p><p><b>Demandado:</b> {{e.demandado}}</p><p><b>Estado:</b> <span class="tag {{e.estado.replace(' ','-')}}">{{e.estado}}</span></p><p><b>Observaciones:</b> {{e.observaciones}}</p>{% if permiso == 'Edición' %}<a class="btn" href="/movimiento/{{e.id}}">Agregar promoción / término</a> <a class="btn btnGreen" href="/audiencia/{{e.id}}">Programar audiencia</a> <a class="btn btnGold" href="/compartir/{{e.id}}">Compartir</a>{% endif %}</div>
+    <div class="grid2"><div class="card"><h2>Vencimientos / movimientos</h2><table><tr><th>Título</th><th>Fecha límite</th><th>Hora</th><th>Estatus</th><th>Archivo</th><th>Autor</th></tr>{% for m in movs %}<tr><td>{{m.titulo}}<br><small>{{m.observaciones}}</small></td><td>{{m.fecha_limite}}</td><td>{{m.hora_limite}}</td><td><span class="tag {{m.estatus.replace(' ','-')}}">{{m.estatus}}</span></td><td>{% if m.archivo %}<a target="_blank" href="/uploads/{{m.archivo}}">Ver</a>{% endif %}</td><td>{{m.autor}}</td></tr>{% endfor %}</table></div>
+    <div class="card"><h2>Audiencias</h2><table><tr><th>Fecha</th><th>Hora</th><th>Audiencia</th><th>Autoridad</th><th>Modalidad</th></tr>{% for a in auds %}<tr><td>{{a.fecha}}</td><td>{{a.hora}}</td><td>{{a.titulo}}</td><td>{{a.autoridad}}</td><td>{{a.modalidad}}</td></tr>{% endfor %}</table></div></div>
+    <div class="card"><h2>Compartido con</h2><table><tr><th>Foto</th><th>Nombre</th><th>Usuario</th><th>Permiso</th></tr>{% for c in compart %}<tr><td>{% if c.foto %}<img class="userphoto" src="/uploads/{{c.foto}}">{% endif %}</td><td>{{c.nombre}}</td><td>{{c.usuario}}</td><td><span class="tag {{c.permiso}}">{{c.permiso}}</span></td></tr>{% endfor %}</table></div>
     """
-    return render(contenido, e=e, movs=movs, compart=compart, permiso=permiso)
+    return render(contenido, e=e, movs=movs, auds=auds, compart=compart, permiso=permiso)
 
 @app.route("/compartir/<int:expediente_id>", methods=["GET","POST"])
 def compartir(expediente_id):
@@ -531,17 +615,19 @@ def compartir(expediente_id):
     u=usuario_actual()
     if request.method=="POST":
         with conectar() as con:
-            con.execute("""INSERT OR REPLACE INTO expedientes_compartidos(expediente_id,usuario_id,permiso,creado_en) VALUES(?,?,?,?)""",(expediente_id,request.form["usuario_id"],request.form["permiso"],datetime.now().strftime("%Y-%m-%d %H:%M")))
+            usuario_destino = con.execute("SELECT * FROM usuarios WHERE id=? AND activo=1", (request.form["usuario_id"],)).fetchone()
+            if not usuario_destino:
+                flash("El usuario seleccionado no existe o no está activo.")
+                return redirect(url_for("compartir", expediente_id=expediente_id))
+            con.execute("INSERT OR REPLACE INTO expedientes_compartidos(expediente_id,usuario_id,permiso,creado_en) VALUES(?,?,?,?)",(expediente_id,request.form["usuario_id"],request.form["permiso"],datetime.now().strftime("%Y-%m-%d %H:%M")))
             con.commit()
-        flash("Expediente compartido.")
+        flash("Expediente compartido con usuario registrado.")
         return redirect(url_for("expediente", id=expediente_id))
     with conectar() as con:
         e=con.execute("SELECT * FROM expedientes WHERE id=?",(expediente_id,)).fetchone()
         usuarios=con.execute("SELECT * FROM usuarios WHERE activo=1 AND id!=? ORDER BY nombre",(u["id"],)).fetchall()
     contenido = """
-    <div class="card"><h2>Compartir expediente {{e.numero}}</h2>
-    <form method="post"><label>Usuario</label><select name="usuario_id">{% for us in usuarios %}<option value="{{us.id}}">{{us.nombre}} - {{us.usuario}}</option>{% endfor %}</select>
-    <label>Permiso</label><select name="permiso"><option>Lectura</option><option>Edición</option></select><button>Compartir</button></form></div>
+    <div class="card"><h2>Compartir expediente {{e.numero}}</h2><p class="small">Solo puedes compartir con usuarios previamente registrados por el administrador.</p><form method="post"><label>Usuario registrado</label><select name="usuario_id" required>{% for us in usuarios %}<option value="{{us.id}}">{{us.nombre}} | Usuario: {{us.usuario}} | Correo: {{us.correo or 'Sin correo'}}</option>{% endfor %}</select><label>Permiso</label><select name="permiso"><option>Lectura</option><option>Edición</option></select><button>Compartir</button></form></div>
     """
     return render(contenido, e=e, usuarios=usuarios)
 
@@ -561,25 +647,58 @@ def movimiento(expediente_id):
                 return redirect(url_for("movimiento", expediente_id=expediente_id))
             archivo_nombre="doc_"+datetime.now().strftime("%Y%m%d%H%M%S_")+secure_filename(archivo.filename)
             archivo.save(UPLOAD_FOLDER / archivo_nombre)
+        notificar = 1 if request.form.get("notificar") == "on" else 0
         with conectar() as con:
-            con.execute("""INSERT INTO movimientos(expediente_id,usuario_id,titulo,fecha,estatus,proxima_accion,fecha_limite,observaciones,archivo,creado_en) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (expediente_id,u["id"],request.form["titulo"],request.form["fecha"],request.form["estatus"],request.form["proxima_accion"],request.form["fecha_limite"],request.form["observaciones"],archivo_nombre,datetime.now().strftime("%Y-%m-%d %H:%M")))
+            con.execute("INSERT INTO movimientos(expediente_id,usuario_id,titulo,fecha,estatus,proxima_accion,fecha_limite,hora_limite,observaciones,archivo,notificar,creado_en) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(expediente_id,u["id"],request.form["titulo"],request.form["fecha"],request.form["estatus"],request.form["proxima_accion"],request.form["fecha_limite"],request.form["hora_limite"],request.form["observaciones"],archivo_nombre,notificar,datetime.now().strftime("%Y-%m-%d %H:%M")))
             con.commit()
-        flash("Movimiento guardado.")
+        flash("Movimiento o vencimiento guardado.")
         return redirect(url_for("expediente", id=expediente_id))
     contenido = """
-    <div class="card"><h2>Agregar promoción / escrito</h2>
-    <form method="post" enctype="multipart/form-data">
-    <label>Título</label><input name="titulo" required>
-    <label>Fecha</label><input type="date" name="fecha">
-    <label>Estatus</label><select name="estatus"><option>Elaborado</option><option>Presentado</option><option>Acordado</option><option>Pendiente</option><option>Vencido</option><option>Concluido</option></select>
-    <label>Próxima acción</label><input name="proxima_accion">
-    <label>Fecha límite / audiencia</label><input type="date" name="fecha_limite">
-    <label>Observaciones</label><textarea name="observaciones" rows="4"></textarea>
-    <label>Archivo PDF, Word o imagen</label><input type="file" name="archivo">
-    <button>Guardar</button></form></div>
+    <div class="card"><h2>Agregar promoción / escrito / vencimiento de término</h2><form method="post" enctype="multipart/form-data"><label>Título</label><input name="titulo" required><label>Fecha del movimiento</label><input type="date" name="fecha"><label>Estatus</label><select name="estatus"><option>Elaborado</option><option>Presentado</option><option>Acordado</option><option>Pendiente</option><option>Vencido</option><option>Concluido</option></select><label>Próxima acción</label><input name="proxima_accion"><label>Fecha límite del término</label><input type="date" name="fecha_limite"><label>Hora límite del término</label><input type="time" name="hora_limite" value="09:00"><label><input type="checkbox" name="notificar" checked style="width:auto"> Notificar 24 horas y 2 horas antes</label><label>Observaciones</label><textarea name="observaciones" rows="4"></textarea><label>Archivo PDF, Word o imagen</label><input type="file" name="archivo"><button>Guardar</button></form></div>
     """
     return render(contenido)
+
+@app.route("/audiencia/<int:expediente_id>", methods=["GET","POST"])
+def audiencia(expediente_id):
+    if not requiere_login(): return redirect(url_for("login"))
+    if permiso_expediente(expediente_id)!="Edición":
+        flash("No tienes permiso para programar audiencias.")
+        return redirect(url_for("expediente", id=expediente_id))
+    u=usuario_actual()
+    if request.method=="POST":
+        notificar = 1 if request.form.get("notificar") == "on" else 0
+        with conectar() as con:
+            con.execute("INSERT INTO audiencias(expediente_id,usuario_id,titulo,fecha,hora,autoridad,sala,modalidad,enlace,observaciones,notificar,creado_en) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (expediente_id,u["id"],request.form["titulo"],request.form["fecha"],request.form["hora"],request.form["autoridad"],request.form["sala"],request.form["modalidad"],request.form["enlace"],request.form["observaciones"],notificar,datetime.now().strftime("%Y-%m-%d %H:%M")))
+            con.commit()
+        flash("Audiencia programada correctamente.")
+        return redirect(url_for("expediente", id=expediente_id))
+    contenido = """
+    <div class="card"><h2>Programar audiencia</h2><form method="post"><label>Tipo o nombre de audiencia</label><input name="titulo" required placeholder="Ejemplo: Audiencia inicial, conciliación, desahogo de pruebas"><label>Fecha</label><input type="date" name="fecha" required><label>Hora</label><input type="time" name="hora" required><label>Autoridad / Juzgado / Tribunal</label><input name="autoridad"><label>Sala</label><input name="sala"><label>Modalidad</label><select name="modalidad"><option>Presencial</option><option>Virtual</option><option>Mixta</option></select><label>Enlace de audiencia virtual</label><input name="enlace" placeholder="https://..."><label><input type="checkbox" name="notificar" checked style="width:auto"> Notificar 24 horas y 2 horas antes</label><label>Observaciones</label><textarea name="observaciones" rows="4"></textarea><button>Guardar audiencia</button></form></div>
+    """
+    return render(contenido)
+
+@app.route("/audiencias")
+def audiencias():
+    if not requiere_login(): return redirect(url_for("login"))
+    u=usuario_actual()
+    with conectar() as con:
+        if u["rol"]=="Administrador":
+            datos=con.execute("SELECT a.*, e.numero, e.tipo, us.nombre propietario FROM audiencias a JOIN expedientes e ON e.id=a.expediente_id JOIN usuarios us ON us.id=e.propietario_id ORDER BY a.fecha ASC, a.hora ASC").fetchall()
+        else:
+            datos=con.execute("""
+                SELECT DISTINCT a.*, e.numero, e.tipo, us.nombre propietario
+                FROM audiencias a
+                JOIN expedientes e ON e.id=a.expediente_id
+                JOIN usuarios us ON us.id=e.propietario_id
+                LEFT JOIN expedientes_compartidos c ON c.expediente_id=e.id
+                WHERE e.propietario_id=? OR c.usuario_id=?
+                ORDER BY a.fecha ASC, a.hora ASC
+            """,(u["id"],u["id"])).fetchall()
+    contenido = """
+    <div class="card"><h2>Audiencias programadas</h2><table><tr><th>Fecha</th><th>Hora</th><th>Expediente</th><th>Audiencia</th><th>Autoridad</th><th>Sala</th><th>Modalidad</th><th>Notifica</th></tr>{% for a in datos %}<tr><td>{{a.fecha}}</td><td>{{a.hora}}</td><td><a href="/expediente/{{a.expediente_id}}">{{a.numero}}</a></td><td>{{a.titulo}}</td><td>{{a.autoridad}}</td><td>{{a.sala}}</td><td>{{a.modalidad}}</td><td>{% if a.notificar %}Sí{% else %}No{% endif %}</td></tr>{% endfor %}</table></div>
+    """
+    return render(contenido, datos=datos)
 
 @app.route("/vencimientos")
 def vencimientos():
@@ -587,15 +706,25 @@ def vencimientos():
     u=usuario_actual()
     with conectar() as con:
         if u["rol"]=="Administrador":
-            datos=con.execute("""SELECT m.*,e.numero,e.tipo FROM movimientos m JOIN expedientes e ON e.id=m.expediente_id WHERE m.fecha_limite IS NOT NULL AND m.fecha_limite!='' ORDER BY m.fecha_limite""").fetchall()
+            datos=con.execute("SELECT m.*,e.numero,e.tipo FROM movimientos m JOIN expedientes e ON e.id=m.expediente_id WHERE m.fecha_limite IS NOT NULL AND m.fecha_limite!='' ORDER BY m.fecha_limite, m.hora_limite").fetchall()
         else:
-            datos=con.execute("""SELECT m.*,e.numero,e.tipo FROM movimientos m JOIN expedientes e ON e.id=m.expediente_id LEFT JOIN expedientes_compartidos c ON c.expediente_id=e.id WHERE m.fecha_limite IS NOT NULL AND m.fecha_limite!='' AND (e.propietario_id=? OR c.usuario_id=?) ORDER BY m.fecha_limite""",(u["id"],u["id"])).fetchall()
+            datos=con.execute("SELECT DISTINCT m.*,e.numero,e.tipo FROM movimientos m JOIN expedientes e ON e.id=m.expediente_id LEFT JOIN expedientes_compartidos c ON c.expediente_id=e.id WHERE m.fecha_limite IS NOT NULL AND m.fecha_limite!='' AND (e.propietario_id=? OR c.usuario_id=?) ORDER BY m.fecha_limite, m.hora_limite",(u["id"],u["id"])).fetchall()
     contenido = """
-    <div class="card"><h2>Vencimientos</h2><table><tr><th>Fecha límite</th><th>Expediente</th><th>Tipo</th><th>Movimiento</th><th>Estatus</th><th>Próxima acción</th></tr>
-    {% for d in datos %}<tr><td>{{d.fecha_limite}}</td><td><a href="/expediente/{{d.expediente_id}}">{{d.numero}}</a></td><td>{{d.tipo}}</td><td>{{d.titulo}}</td><td><span class="tag {{d.estatus.replace(' ','-')}}">{{d.estatus}}</span></td><td>{{d.proxima_accion}}</td></tr>{% endfor %}
-    </table></div>
+    <div class="card"><h2>Vencimientos de términos</h2><table><tr><th>Fecha límite</th><th>Hora</th><th>Expediente</th><th>Tipo</th><th>Movimiento</th><th>Estatus</th><th>Notifica</th><th>Próxima acción</th></tr>{% for d in datos %}<tr><td>{{d.fecha_limite}}</td><td>{{d.hora_limite}}</td><td><a href="/expediente/{{d.expediente_id}}">{{d.numero}}</a></td><td>{{d.tipo}}</td><td>{{d.titulo}}</td><td><span class="tag {{d.estatus.replace(' ','-')}}">{{d.estatus}}</span></td><td>{% if d.notificar %}Sí{% else %}No{% endif %}</td><td>{{d.proxima_accion}}</td></tr>{% endfor %}</table></div>
     """
     return render(contenido, datos=datos)
+
+@app.route("/notificaciones")
+def notificaciones():
+    if not requiere_login(): return redirect(url_for("login"))
+    if not es_admin():
+        flash("Solo el administrador puede revisar notificaciones.")
+        return redirect(url_for("inicio"))
+    enviados = revisar_y_enviar_notificaciones()
+    contenido = """
+    <div class="card"><h2>Revisión de notificaciones</h2><p>Notificaciones enviadas o simuladas en esta revisión: <b>{{enviados}}</b></p><p class="small">Para envío real por correo, configura SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS y FROM_EMAIL en Render.</p></div>
+    """
+    return render(contenido, enviados=enviados)
 
 @app.route("/jurisprudencia")
 def jurisprudencia():
@@ -604,22 +733,14 @@ def jurisprudencia():
     scjn=SCJN_BUSCADOR + ("?q="+quote_plus(q) if q else "")
     sjf=SCJN_TESIS + ("?q="+quote_plus(q) if q else "")
     contenido = """
-    <div class="card">
-        <h2>Jurisprudencia y enlaces oficiales</h2>
-        <form method="get"><label>Buscar concepto</label><input name="q" value="{{q}}" placeholder="Ejemplo: negativa ficta, daño patrimonial, prescripción"><button>Preparar búsqueda</button></form>
-        {% if q %}<p>Búsqueda preparada: <b>{{q}}</b></p><a class="btn btnGold" target="_blank" href="{{scjn}}">Buscar en SCJN</a> <a class="btn btnGold" target="_blank" href="{{sjf}}">Buscar tesis</a>{% endif %}
-    </div>
-    <div class="card">
-        <h2>Tribunales y boletines</h2>
-        <a class="btn btn2" target="_blank" href="{{BOLETIN_PJBC}}">Boletín Judicial BC</a>
-        <a class="btn btn2" target="_blank" href="{{PJBC_PORTAL}}">Tribunal / Poder Judicial BC</a>
-        <a class="btn btn2" target="_blank" href="{{TEJA_BC}}">TEJA BC</a>
-        <a class="btn btn2" target="_blank" href="{{TEJA_LISTAS}}">Listas TEJA</a>
-        <a class="btn btnGold" target="_blank" href="{{SCJN_BUSCADOR}}">Buscador Jurídico SCJN</a>
-        <a class="btn btnGold" target="_blank" href="{{SCJN_TESIS}}">Semanario Judicial</a>
-    </div>
+    <div class="card"><h2>Jurisprudencia y enlaces oficiales</h2><form method="get"><label>Buscar concepto</label><input name="q" value="{{q}}" placeholder="Ejemplo: negativa ficta, daño patrimonial, prescripción"><button>Preparar búsqueda</button></form>{% if q %}<p>Búsqueda preparada: <b>{{q}}</b></p><a class="btn btnGold" target="_blank" href="{{scjn}}">Buscar en SCJN</a> <a class="btn btnGold" target="_blank" href="{{sjf}}">Buscar tesis</a>{% endif %}</div><div class="card"><h2>Tribunales y boletines</h2><a class="btn btn2" target="_blank" href="{{BOLETIN_PJBC}}">Boletín Judicial BC</a> <a class="btn btn2" target="_blank" href="{{PJBC_PORTAL}}">Tribunal / Poder Judicial BC</a> <a class="btn btn2" target="_blank" href="{{TEJA_BC}}">TEJA BC</a> <a class="btn btn2" target="_blank" href="{{TEJA_LISTAS}}">Listas TEJA</a> <a class="btn btnGold" target="_blank" href="{{SCJN_BUSCADOR}}">Buscador Jurídico SCJN</a> <a class="btn btnGold" target="_blank" href="{{SCJN_TESIS}}">Semanario Judicial</a></div>
     """
     return render(contenido, q=q, scjn=scjn, sjf=sjf, BOLETIN_PJBC=BOLETIN_PJBC, PJBC_PORTAL=PJBC_PORTAL, TEJA_BC=TEJA_BC, TEJA_LISTAS=TEJA_LISTAS, SCJN_BUSCADOR=SCJN_BUSCADOR, SCJN_TESIS=SCJN_TESIS)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    if len(os.sys.argv) > 1 and os.sys.argv[1] == "notificaciones":
+        total = revisar_y_enviar_notificaciones()
+        print(f"Notificaciones procesadas: {total}")
+    else:
+        port = int(os.environ.get("PORT", 5000))
+        app.run(host="0.0.0.0", port=port, debug=False)
